@@ -1,0 +1,40 @@
+service: sodaware-video
+
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: nodejs16.x
+  memorySize: 256
+  timeout: 899
+  region: eu-central-1
+  vpc:
+    securityGroupIds:
+      - sg-06c4edd20f270affa
+    subnetIds:
+      - subnet-0397e7d5a0dabcd3d
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - lambda:InvokeFunction
+            - lambda:InvokeAsync
+            - s3:*
+            - mediaconvert:*
+            - iam:ListRoles
+            - iam:PassRole
+            - sts:AssumeRole
+            - ssm:Get*
+            - ssm:List*
+            - ssm:Describe*
+          Resource: "*"
+  environment:
+      memcache: "soda-lambda-memcache.4q4bgd.0001.euc1.cache.amazonaws.com"
+
+functions:
+  createPreviews:
+    handler: handler.createPreviews
+
+  createDownload:
+    handler: handler.createDownload
