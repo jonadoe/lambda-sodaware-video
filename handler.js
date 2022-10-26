@@ -6,7 +6,7 @@ const SodaBaseConfigStore = require('@sodatechag/npm-base-config');
 const SodaCache = require('@sodatechag/npm-cache');
 const SodaDb = require('@sodatechag/npm-db');
 const SodaConfig = require('@sodatechag/npm-config');
-const { S3Client, HeadObjectCommand } = require("@aws-sdk/client-s3");
+const { S3Client, HeadObjectCommand, S3 } = require("@aws-sdk/client-s3");
 
 
 module.exports.createPreviews = async (event) => {
@@ -90,9 +90,10 @@ module.exports.createDownload = async (event) => {
     const statusToken = event?.statusToken;
     const userId = Number(event?.userId);
     const assetId = Number(event?.assetId);
-    const size = event?.size;
+    const size = event?.size.toLowerCase();
 
     const dbFunctionName = 'sodaware-video-prod-createDownload';
+    const sizesToCopy = ['original', 'wprev'];
 
     try {
 
@@ -103,7 +104,7 @@ module.exports.createDownload = async (event) => {
 
         let videoDownloadSizes = await config.get('VIDEO_SIZES');
 
-        if( !("DOWNLOAD" in videoDownloadSizes) || !(size in videoDownloadSizes.DOWNLOAD) || !videoDownloadSizes.DOWNLOAD[size] ) {
+        if( !sizesToCopy.includes(size) && (!("DOWNLOAD" in videoDownloadSizes) || !(size in videoDownloadSizes.DOWNLOAD) || !videoDownloadSizes.DOWNLOAD[size]) ) {
             throw new Error('Invalid download size');
         }
 
@@ -116,29 +117,69 @@ module.exports.createDownload = async (event) => {
             throw new Error('Asset is not a video');
         }
 
-        // let targetBucket = await config.get('AMAZON_S3_BUCKET_PICS');
-        // let assetData = await getAssetData(assetId);
-
-        const bucket = projectId +"-temp";
-        const s3KeyWithoutExtension = "video-download/"+ size +"/"+ assetId;
+        const bucket = await config.get('AMAZON_S3_BUCKET_PICS');
+        const s3KeyWithoutExtension = "downloads/video/"+ size +"/"+ assetId;
         const destinationUrl = "s3://"+ bucket +"/"+ s3KeyWithoutExtension;
         const destinationUrlExtension = "mp4";
         const s3Key = s3KeyWithoutExtension +'.'+ destinationUrlExtension;
         const finalFile = destinationUrl +'.'+ destinationUrlExtension;
 
-        const preset = videoDownloadSizes?.DOWNLOAD[ size ];
-
         if( await s3FileExistsAndIsFreshEnough(bucket, s3Key) ) {
 
-            await db.query("INSERT INTO Lambda_Status SET ?", {
-                function_name: dbFunctionName,
-                token: statusToken,
-                time_start: db.raw('NOW()'),
-                time_heartbeat: db.raw('NOW()'),
-                time_end: db.raw('NOW()'),
-                'status': 'finished',
-                data: finalFile
-            } );
+            try {
+                await db.query("INSERT INTO Lambda_Status SET ?", {
+                    function_name: dbFunctionName,
+                    token: statusToken,
+                    time_start: db.raw('NOW()'),
+                    time_heartbeat: db.raw('NOW()'),
+                    time_end: db.raw('NOW()'),
+                    'status': 'finished',
+                    data: finalFile
+                });
+            }
+            catch(error) {
+                throw new Error('Duplicate statusToken');
+            }
+
+            return {
+                "status": "success",
+                "statusToken": statusToken
+            };
+        }
+
+        if( sizesToCopy.includes(size) ) {
+
+            let location = null;
+
+            if( size == 'original' ) {
+                location = await getMediaFileLocation(projectId, assetId);
+            }
+            else if( size == 'wprev' ) {
+                const dotPos = assetData.picname.lastIndexOf('.');
+                const assetFileNameWithoutExtension = assetData.picname.substring(0, (dotPos > 0) ? dotPos : assetData.picname.length );
+
+                location = 's3://'+ bucket +'/'+ assetData.pcode +'/public/'+ assetFileNameWithoutExtension +'.mp4';
+            }
+            else {
+                throw new Error('Unknown size');
+            }
+
+            await copyS3File(location, bucket, s3Key);
+
+            try {
+                await db.query("INSERT INTO Lambda_Status SET ?", {
+                    function_name: dbFunctionName,
+                    token: statusToken,
+                    time_start: db.raw('NOW()'),
+                    time_heartbeat: db.raw('NOW()'),
+                    time_end: db.raw('NOW()'),
+                    'status': 'finished',
+                    data: location
+                } );
+            }
+            catch(error) {
+                throw new Error('Duplicate statusToken');
+            }
 
             return {
                 "status": "success",
@@ -148,9 +189,7 @@ module.exports.createDownload = async (event) => {
 
         const location = await getMediaFileLocation(projectId, assetId);
 
-        console.log('MEDIA FILE LOCATION IS: ' + location);
-
-        console.log("Converting video file");
+        const preset = videoDownloadSizes?.DOWNLOAD[ size ];
 
         let jobId = await convertVideoFile(location, preset, destinationUrl, destinationUrlExtension, projectId, statusToken, assetId, size, dbFunctionName, false);
 
@@ -297,7 +336,7 @@ async function getAssetData(db, assetId) {
 
 async function s3FileExistsAndIsFreshEnough(bucket, key) {
     const s3Client = new S3Client({
-      region: "eu-central-1",
+      region: "eu-west-1",
     });
 
     try {
@@ -306,25 +345,49 @@ async function s3FileExistsAndIsFreshEnough(bucket, key) {
             'Key': key
         }) );
 
-        console.log("FILE EXISTS!!!!!");
         const expirationDate = new Date(response?.Expiration?.match('"([^"]+)GMT"')[0]);
         const expiresIn = (expirationDate.valueOf() - Date.now()) / 1000;
 
         console.log("Expires in seconds: "+ expiresIn);
 
-        if(expiresIn > 43200 ) { // 12 hours
+        if(expiresIn > 10800 ) { // 3 hours
             console.log("FILE is fresh enough!");
             return true;
         }
 
     } catch (err) {
-
-
-        console.log("S3 ERROR: "+ err.message);
+        // console.log("S3 ERROR: "+ err.message);
         // ignore
     }
 
-console.log("FILE DOES NOT EXIST!");
+    return false;
+}
 
+async function copyS3File(copySource, bucket, key) {
+
+    if(copySource.substring(0,5) == 's3://') {
+        copySource = copySource.substring(5);
+    }
+
+    try {
+        const s3Client = new S3({
+          region: "eu-west-1",
+        });
+
+        await s3Client.copyObject({
+            'Bucket': bucket,
+            'Key': key,
+            'CopySource': copySource,
+            'ACL': "public-read"
+        });
+
+        console.log("copied S3 object");
+
+        return true;
+
+    } catch (err) {
+        console.log("Could not copy S3 object: "+ err.message);
+        // ignore
+    }
     return false;
 }
